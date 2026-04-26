@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import json
 import os
+import queue
 import re
 import ssl
+import threading
 import time
+import uuid
 import warnings
 import urllib.error
 import urllib.parse
@@ -21,6 +24,10 @@ OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated
 INITIAL_POLL_DELAY_SECONDS = 12
 POLL_INTERVAL_SECONDS = 5
 MAX_WAIT_SECONDS = 600
+JOB_QUEUE = queue.Queue()
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+WORKER_STARTED = False
 
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
@@ -279,6 +286,69 @@ INDEX_HTML = """<!doctype html>
       gap: 12px;
     }
 
+    .queue-list {
+      display: grid;
+      gap: 10px;
+      max-height: 360px;
+      overflow: auto;
+    }
+
+    .queue-item {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.62);
+      display: grid;
+      gap: 8px;
+      text-align: left;
+      box-shadow: none;
+      color: var(--ink);
+    }
+
+    .queue-item.active {
+      border-color: rgba(189, 93, 56, 0.55);
+      background: rgba(255, 250, 240, 0.95);
+    }
+
+    .queue-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .queue-title {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .queue-status {
+      flex: 0 0 auto;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .queue-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .mini-button {
+      padding: 8px 11px;
+      font-size: 12px;
+      box-shadow: none;
+    }
+
+    .danger-button {
+      background: linear-gradient(135deg, #bd5548, #8b2e2e);
+    }
+
     .file-list {
       margin-top: 10px;
       display: grid;
@@ -406,7 +476,7 @@ INDEX_HTML = """<!doctype html>
         </div>
 
         <div class="actions">
-          <button id="submitBtn" type="submit">开始生成</button>
+          <button id="submitBtn" type="submit">加入队列</button>
           <button id="fillDemoBtn" class="ghost" type="button">填入示例</button>
         </div>
       </form>
@@ -435,6 +505,11 @@ INDEX_HTML = """<!doctype html>
       <div>
         <p class="panel-title">运行日志</p>
         <pre id="logBox" class="log">准备就绪，填写参数后点击“开始生成”。</pre>
+      </div>
+
+      <div>
+        <p class="panel-title">任务队列</p>
+        <div id="queueList" class="queue-list"></div>
       </div>
 
       <div>
@@ -470,7 +545,10 @@ INDEX_HTML = """<!doctype html>
     const taskIdNode = document.getElementById("taskId");
     const imageUrlNode = document.getElementById("imageUrl");
     const fileListNode = document.getElementById("fileList");
+    const queueListNode = document.getElementById("queueList");
     let uploadedImageDataUrls = [];
+    let jobs = [];
+    let selectedJobId = null;
 
     function setStatus(text, kind) {
       statusBadge.textContent = text;
@@ -490,6 +568,102 @@ INDEX_HTML = """<!doctype html>
       }
       imageFrame.innerHTML = '<img alt="生成结果" src="' + url + '">';
       imageUrlNode.innerHTML = '<a href="' + url + '" target="_blank" rel="noreferrer">' + url + '</a>';
+    }
+
+    function statusLabel(status) {
+      const labels = {
+        queued: "排队中",
+        running: "生成中",
+        completed: "已完成",
+        failed: "失败",
+        cancelled: "已取消",
+        timed_out: "已超时"
+      };
+      return labels[status] || status || "未知";
+    }
+
+    function renderQueue() {
+      if (!jobs.length) {
+        queueListNode.innerHTML = '<div class="placeholder">暂无任务。</div>';
+        return;
+      }
+
+      queueListNode.innerHTML = jobs.map(job => {
+        const active = job.job_id === selectedJobId ? " active" : "";
+        const canCancel = job.status === "queued" || job.status === "running";
+        const safePrompt = (job.prompt || "未命名任务").replace(/[&<>"']/g, char => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;"
+        }[char]));
+        return `
+          <div class="queue-item${active}" data-job-id="${job.job_id}">
+            <div class="queue-head">
+              <div class="queue-title">${safePrompt}</div>
+              <div class="queue-status">${statusLabel(job.status)} · ${job.progress || 0}%</div>
+            </div>
+            <div class="queue-actions">
+              <button class="mini-button ghost" type="button" data-action="select" data-job-id="${job.job_id}">查看</button>
+              ${canCancel ? `<button class="mini-button danger-button" type="button" data-action="cancel" data-job-id="${job.job_id}">取消</button>` : ""}
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function showJob(job) {
+      if (!job) {
+        setStatus("等待提交", "waiting");
+        setLog(["准备就绪，填写参数后点击“加入队列”。"]);
+        taskIdNode.textContent = "-";
+        setImage("");
+        return;
+      }
+
+      selectedJobId = job.job_id;
+      taskIdNode.textContent = job.task_id || job.job_id || "-";
+      setLog(job.logs || []);
+      setImage(job.image_url || "");
+
+      if (job.saved_path) {
+        imageUrlNode.innerHTML += '<br><br><strong>本地保存:</strong><br>' + job.saved_path;
+      }
+
+      if (job.status === "completed") {
+        setStatus("生成完成", "");
+      } else if (job.status === "failed" || job.status === "timed_out") {
+        setStatus(statusLabel(job.status), "error");
+      } else if (job.status === "cancelled") {
+        setStatus("已取消", "error");
+      } else {
+        setStatus(statusLabel(job.status), "waiting");
+      }
+
+      renderQueue();
+    }
+
+    async function refreshJobs() {
+      try {
+        const response = await fetch("/api/jobs");
+        const result = await response.json();
+        if (!response.ok) {
+          throw new Error(result.error || "获取队列失败");
+        }
+
+        jobs = result.jobs || [];
+        if (!selectedJobId && jobs.length) {
+          selectedJobId = jobs[0].job_id;
+        }
+        const selected = jobs.find(job => job.job_id === selectedJobId) || jobs[0];
+        renderQueue();
+        if (selected) {
+          showJob(selected);
+        }
+      } catch (error) {
+        setStatus("队列刷新失败", "error");
+      }
     }
 
     function renderFileList(files) {
@@ -591,10 +765,8 @@ INDEX_HTML = """<!doctype html>
       }
 
       submitBtn.disabled = true;
-      taskIdNode.textContent = "-";
-      setImage("");
-      setStatus("提交中", "waiting");
-      setLog(["正在提交任务..."]);
+      setStatus("入队中", "waiting");
+      setLog(["正在加入任务队列..."]);
 
       try {
         const response = await fetch("/api/generate", {
@@ -615,12 +787,51 @@ INDEX_HTML = """<!doctype html>
           throw new Error(result.error || "请求失败");
         }
 
-        await handleTaskResult(result);
+        selectedJobId = result.job_id;
+        setStatus("已加入队列", "waiting");
+        setLog(result.logs || ["任务已加入队列。"]);
+        await refreshJobs();
       } catch (error) {
         setStatus("请求失败", "error");
         setLog([String(error.message || error)]);
       } finally {
         submitBtn.disabled = false;
+      }
+    });
+
+    queueListNode.addEventListener("click", async (event) => {
+      const button = event.target.closest("button[data-action]");
+      if (!button) {
+        const item = event.target.closest("[data-job-id]");
+        if (item) {
+          selectedJobId = item.dataset.jobId;
+          const selected = jobs.find(job => job.job_id === selectedJobId);
+          showJob(selected);
+        }
+        return;
+      }
+
+      const jobId = button.dataset.jobId;
+      if (button.dataset.action === "select") {
+        selectedJobId = jobId;
+        showJob(jobs.find(job => job.job_id === jobId));
+        return;
+      }
+
+      if (button.dataset.action === "cancel") {
+        button.disabled = true;
+        try {
+          const response = await fetch(`/api/jobs/${jobId}/cancel`, { method: "POST" });
+          const result = await response.json();
+          if (!response.ok) {
+            throw new Error(result.error || "取消失败");
+          }
+          selectedJobId = jobId;
+          await refreshJobs();
+        } catch (error) {
+          setStatus("取消失败", "error");
+          setLog([String(error.message || error)]);
+        }
       }
     });
 
@@ -671,6 +882,9 @@ INDEX_HTML = """<!doctype html>
         lookupBtn.disabled = false;
       }
     });
+
+    refreshJobs();
+    setInterval(refreshJobs, 2500);
   </script>
 </body>
 </html>
@@ -862,6 +1076,233 @@ def extract_error_body(error):
         }
 
 
+def job_log(job, message):
+    with JOBS_LOCK:
+        job["logs"].append(message)
+        job["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+def update_job(job, **fields):
+    with JOBS_LOCK:
+        job.update(fields)
+        job["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+def is_cancelled(job):
+    with JOBS_LOCK:
+        return bool(job.get("cancel_requested"))
+
+
+def wait_for_job(job, seconds):
+    end_time = time.time() + seconds
+    while time.time() < end_time:
+        if is_cancelled(job):
+            return False
+        time.sleep(min(0.5, max(0, end_time - time.time())))
+    return True
+
+
+def public_job(job):
+    return {
+        "job_id": job["job_id"],
+        "task_id": job.get("task_id"),
+        "status": job.get("status"),
+        "progress": job.get("progress", 0),
+        "prompt": job.get("prompt", ""),
+        "size": job.get("size", ""),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "image_url": job.get("image_url"),
+        "saved_path": job.get("saved_path"),
+        "error": job.get("error"),
+        "logs": list(job.get("logs", [])),
+    }
+
+
+def list_public_jobs():
+    with JOBS_LOCK:
+        ordered_jobs = sorted(JOBS.values(), key=lambda item: item.get("created_at", ""), reverse=True)
+        return [public_job(job) for job in ordered_jobs]
+
+
+def get_job(job_id):
+    with JOBS_LOCK:
+        return JOBS.get(job_id)
+
+
+def create_generation_job(api_key, prompt, size, official_fallback, image_urls):
+    now = datetime.now().isoformat(timespec="seconds")
+    job_id = uuid.uuid4().hex[:12]
+    job = {
+        "job_id": job_id,
+        "task_id": None,
+        "api_key": api_key,
+        "prompt": prompt,
+        "size": size,
+        "official_fallback": official_fallback,
+        "image_urls": image_urls,
+        "status": "queued",
+        "progress": 0,
+        "image_url": None,
+        "saved_path": None,
+        "error": None,
+        "logs": [
+            "任务已加入本地队列。",
+            f"size={size}",
+            f"official_fallback={str(official_fallback).lower()}",
+            f"reference_images={len(image_urls)}",
+        ],
+        "cancel_requested": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+    JOB_QUEUE.put(job_id)
+    return job
+
+
+def process_generation_job(job):
+    if is_cancelled(job):
+        update_job(job, status="cancelled")
+        job_log(job, "任务已在开始前取消。")
+        return
+
+    update_job(job, status="running")
+    job_log(job, "开始提交到 APIMart。")
+
+    payload = {
+        "model": "gpt-image-2",
+        "prompt": job["prompt"],
+        "n": 1,
+        "size": job["size"],
+        "official_fallback": job["official_fallback"],
+    }
+    if job["image_urls"]:
+        payload["image_urls"] = job["image_urls"]
+
+    try:
+        submit_result = http_json_request(
+            "POST",
+            f"{APIMART_BASE_URL}/v1/images/generations",
+            job["api_key"],
+            payload=payload,
+        )
+    except Exception as error:
+        update_job(job, status="failed", error=f"提交任务失败: {extract_error_body(error)}")
+        job_log(job, job["error"])
+        return
+
+    task_id = (
+        submit_result.get("data", [{}])[0].get("task_id")
+        if isinstance(submit_result.get("data"), list) and submit_result.get("data")
+        else None
+    )
+
+    if not task_id:
+        update_job(job, status="failed", error=f"未从提交结果中拿到 task_id: {submit_result}")
+        job_log(job, job["error"])
+        return
+
+    update_job(job, task_id=task_id)
+    job_log(job, f"任务已提交，task_id={task_id}")
+    job_log(job, f"按 APIMart 建议，先等待 {INITIAL_POLL_DELAY_SECONDS} 秒再开始首次查询。")
+
+    if not wait_for_job(job, INITIAL_POLL_DELAY_SECONDS):
+        update_job(job, status="cancelled", error="已取消本地轮询。")
+        job_log(job, "已取消本地轮询；APIMart 上已提交的远端任务可能仍会继续运行。")
+        return
+
+    deadline = time.time() + MAX_WAIT_SECONDS
+    task_result = None
+
+    while time.time() < deadline:
+        if is_cancelled(job):
+            update_job(job, status="cancelled", error="已取消本地轮询。")
+            job_log(job, "已取消本地轮询；APIMart 上已提交的远端任务可能仍会继续运行。")
+            return
+
+        try:
+            task_result = fetch_task_status(task_id, job["api_key"])
+        except Exception as error:
+            job_log(job, f"任务状态查询异常，准备重试: {extract_error_body(error)}")
+            transient_recovered = False
+            for retry_index in range(3):
+                if not wait_for_job(job, 2 + retry_index):
+                    update_job(job, status="cancelled", error="已取消本地轮询。")
+                    job_log(job, "已取消本地轮询；APIMart 上已提交的远端任务可能仍会继续运行。")
+                    return
+                try:
+                    task_result = fetch_task_status(task_id, job["api_key"])
+                    job_log(job, f"任务状态查询重试成功，第 {retry_index + 1} 次恢复。")
+                    transient_recovered = True
+                    break
+                except Exception as retry_error:
+                    job_log(job, f"任务状态查询重试失败，第 {retry_index + 1} 次: {extract_error_body(retry_error)}")
+            if not transient_recovered:
+                update_job(job, status="failed", error=f"查询任务状态失败: {extract_error_body(error)}")
+                job_log(job, job["error"])
+                return
+
+        task_data = task_result.get("data", {})
+        status = task_data.get("status", "unknown")
+        progress = task_data.get("progress", 0)
+        update_job(job, progress=progress)
+        job_log(job, f"轮询状态: status={status}, progress={progress}")
+
+        if status == "completed":
+            image_url = extract_image_url(task_result)
+            update_job(job, status="completed", image_url=image_url, progress=100)
+            job_log(job, "任务完成，已拿到图片链接。")
+            if image_url:
+                try:
+                    saved_path = download_image_to_local(image_url, job["prompt"], task_id)
+                    update_job(job, saved_path=saved_path)
+                    job_log(job, f"图片已自动保存到本地: {saved_path}")
+                except Exception as error:
+                    job_log(job, f"自动保存到本地失败: {error}")
+            return
+
+        if status == "failed":
+            error_info = task_data.get("error", {})
+            update_job(job, status="failed", error=f"任务失败: {error_info}")
+            job_log(job, job["error"])
+            return
+
+        if status == "cancelled":
+            update_job(job, status="cancelled", error="远端任务已取消。")
+            job_log(job, "远端任务已取消。")
+            return
+
+        if not wait_for_job(job, POLL_INTERVAL_SECONDS):
+            update_job(job, status="cancelled", error="已取消本地轮询。")
+            job_log(job, "已取消本地轮询；APIMart 上已提交的远端任务可能仍会继续运行。")
+            return
+
+    update_job(job, status="timed_out", error="等待任务完成超时。")
+    job_log(job, f"本地等待上限为 {MAX_WAIT_SECONDS} 秒，可使用 task_id 手动查询。")
+
+
+def worker_loop():
+    while True:
+        job_id = JOB_QUEUE.get()
+        try:
+            job = get_job(job_id)
+            if job:
+                process_generation_job(job)
+        finally:
+            JOB_QUEUE.task_done()
+
+
+def start_worker_once():
+    global WORKER_STARTED
+    if WORKER_STARTED:
+        return
+    worker = threading.Thread(target=worker_loop, daemon=True)
+    worker.start()
+    WORKER_STARTED = True
+
+
 class AppHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
@@ -873,9 +1314,28 @@ class AppHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        if self.path == "/api/jobs":
+            json_response(self, 200, {"jobs": list_public_jobs()})
+            return
+
         json_response(self, 404, {"error": "Not found"})
 
     def do_POST(self):
+        if self.path.startswith("/api/jobs/") and self.path.endswith("/cancel"):
+            job_id = self.path.split("/")[3]
+            job = get_job(job_id)
+            if not job:
+                json_response(self, 404, {"error": "任务不存在"})
+                return
+            update_job(job, cancel_requested=True)
+            if job.get("status") == "queued":
+                update_job(job, status="cancelled", error="任务已取消。")
+                job_log(job, "任务已在队列中取消。")
+            else:
+                job_log(job, "收到取消请求，正在停止本地轮询。")
+            json_response(self, 200, {"job": public_job(job)})
+            return
+
         if self.path not in ("/api/generate", "/api/task-status"):
             json_response(self, 404, {"error": "Not found"})
             return
@@ -941,138 +1401,15 @@ class AppHandler(BaseHTTPRequestHandler):
             json_response(self, 400, {"error": "参考图最多 16 张"})
             return
 
-        payload = {
-            "model": "gpt-image-2",
-            "prompt": prompt,
-            "n": 1,
-            "size": size,
-            "official_fallback": official_fallback,
-        }
-        if cleaned_image_urls:
-            payload["image_urls"] = cleaned_image_urls
-
-        logs = [
-            "准备提交到 APIMart...",
-            f"size={size}",
-            f"official_fallback={str(official_fallback).lower()}",
-            f"reference_images={len(cleaned_image_urls)}",
-        ]
-
-        try:
-            submit_result = http_json_request(
-                "POST",
-                f"{APIMART_BASE_URL}/v1/images/generations",
-                api_key,
-                payload=payload,
-            )
-        except Exception as error:
-            json_response(
-                self,
-                502,
-                {"error": f"提交任务失败: {extract_error_body(error)}"},
-            )
-            return
-
-        task_id = (
-            submit_result.get("data", [{}])[0].get("task_id")
-            if isinstance(submit_result.get("data"), list) and submit_result.get("data")
-            else None
-        )
-
-        if not task_id:
-            json_response(
-                self,
-                502,
-                {"error": f"未从提交结果中拿到 task_id: {submit_result}"},
-            )
-            return
-
-        logs.append(f"任务已提交，task_id={task_id}")
-        logs.append(f"按 APIMart 建议，先等待 {INITIAL_POLL_DELAY_SECONDS} 秒再开始首次查询。")
-        time.sleep(INITIAL_POLL_DELAY_SECONDS)
-
-        deadline = time.time() + MAX_WAIT_SECONDS
-        task_result = None
-
-        while time.time() < deadline:
-            try:
-                task_result = fetch_task_status(task_id, api_key)
-            except Exception as error:
-                logs.append(f"任务状态查询异常，准备重试: {extract_error_body(error)}")
-                transient_recovered = False
-                for retry_index in range(3):
-                    try:
-                        time.sleep(2 + retry_index)
-                        task_result = fetch_task_status(task_id, api_key)
-                        logs.append(f"任务状态查询重试成功，第 {retry_index + 1} 次恢复。")
-                        transient_recovered = True
-                        break
-                    except Exception as retry_error:
-                        logs.append(f"任务状态查询重试失败，第 {retry_index + 1} 次: {extract_error_body(retry_error)}")
-                if not transient_recovered:
-                    json_response(
-                        self,
-                        502,
-                        {"error": f"查询任务状态失败: {extract_error_body(error)}", "task_id": task_id, "logs": logs},
-                    )
-                    return
-
-            task_data = task_result.get("data", {})
-            status = task_data.get("status", "unknown")
-            progress = task_data.get("progress", 0)
-            logs.append(f"轮询状态: status={status}, progress={progress}")
-
-            if status == "completed":
-                break
-
-            if status == "failed":
-                error_info = task_data.get("error", {})
-                json_response(
-                    self,
-                    502,
-                    {
-                        "error": f"任务失败: {error_info}",
-                        "task_id": task_id,
-                        "logs": logs,
-                    },
-                )
-                return
-
-            if status == "cancelled":
-                json_response(
-                    self,
-                    502,
-                    {"error": "任务已被取消", "task_id": task_id, "logs": logs},
-                )
-                return
-
-            time.sleep(POLL_INTERVAL_SECONDS)
-        else:
-            json_response(
-                self,
-                504,
-                {
-                    "error": "等待任务完成超时，请稍后用 task_id 手动查询",
-                    "task_id": task_id,
-                    "logs": logs + [
-                        f"本地等待上限为 {MAX_WAIT_SECONDS} 秒，页面下方“手动查询 Task ID”可继续查询。",
-                    ],
-                },
-            )
-            return
-        logs.append("任务完成，已拿到图片链接。")
-
-        json_response(
-            self,
-            200,
-            build_task_status_response(task_id, task_result, logs, prompt_for_save=prompt),
-        )
+        job = create_generation_job(api_key, prompt, size, official_fallback, cleaned_image_urls)
+        json_response(self, 202, {"job_id": job["job_id"], "job": public_job(job), "logs": job["logs"]})
 
     def log_message(self, format, *args):
         return
 
 
 def main():
+    start_worker_once()
     port = int(os.environ.get("PORT", PORT))
     server = ThreadingHTTPServer((HOST, port), AppHandler)
     print(f"Server running at http://{HOST}:{port}")
