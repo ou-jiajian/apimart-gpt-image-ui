@@ -679,11 +679,16 @@ INDEX_HTML = """<!doctype html>
 
 def json_response(handler, status_code, payload):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    handler.send_response(status_code)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.send_response(status_code)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+        # The browser may close a long-running request after refresh/navigation.
+        # The task may still be running on APIMart, so this is safe to ignore.
+        return
 
 
 def should_retry_with_insecure_ssl(error):
